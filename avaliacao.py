@@ -7,81 +7,9 @@ from fpdf import FPDF
 from PIL import Image
 from datetime import datetime
 import os, re, json
-import gspread
-from google.oauth2.service_account import Credentials
 
 APP_TITLE = "Avaliação de Desempenho do Colaborador"
 FONT_PATH = os.path.join(os.path.dirname(__file__), "DejaVuSans.ttf")
-
-# ===================== LOGIN (simples via secrets) =====================
-def get_users_from_secrets():
-    try:
-        return st.secrets["credentials"]["users"]
-    except Exception:
-        return []
-
-def do_login():
-    st.sidebar.subheader("Login")
-    email_in = st.sidebar.text_input("E-mail")
-    pw_in    = st.sidebar.text_input("Senha", type="password")
-    ok = st.sidebar.button("Entrar")
-    users = get_users_from_secrets()
-
-    if ok:
-        for u in users:
-            if u.get("email") == email_in and u.get("password") == pw_in:
-                st.session_state["auth"] = True
-                st.session_state["user_email"] = u.get("email")
-                st.session_state["user_name"]  = u.get("name", u.get("email"))
-                st.sidebar.success("Logado!")
-                return True
-        st.sidebar.error("E-mail ou senha inválidos.")
-    return st.session_state.get("auth", False)
-
-def logout():
-    if st.sidebar.button("Sair"):
-        for k in ["auth","user_email","user_name"]:
-            st.session_state.pop(k, None)
-        st.experimental_rerun()
-
-# ===================== STORAGE (Google Sheets) =====================
-def get_gspread_client():
-    sa_info = dict(st.secrets["gcp_service_account"])
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-    return gspread.authorize(creds)
-
-def get_storage_sheet():
-    gc = get_gspread_client()
-    sh = gc.open(st.secrets["storage"]["sheet_name"])
-    ws = sh.worksheet(st.secrets["storage"]["worksheet"])
-    return ws
-
-def save_model(email: str, nivel: str, perguntas_cfg: dict):
-    ws = get_storage_sheet()
-    categorias_json = json.dumps(perguntas_cfg, ensure_ascii=False)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    records = ws.get_all_records()
-    row_idx = None
-    for i, r in enumerate(records, start=2):
-        if r.get("email") == email and r.get("nivel") == nivel:
-            row_idx = i
-            break
-    if row_idx:
-        ws.update(f"C{row_idx}:D{row_idx}", [[categorias_json, now]])
-    else:
-        ws.append_row([email, nivel, categorias_json, now])
-
-def load_model(email: str, nivel: str) -> dict | None:
-    ws = get_storage_sheet()
-    records = ws.get_all_records()
-    for r in records:
-        if r.get("email") == email and r.get("nivel") == nivel:
-            try:
-                return json.loads(r.get("categorias_json") or "{}")
-            except Exception:
-                return None
-    return None
 
 # ===================== Utils PDF/Gráficos =====================
 def sanitize_filename(name: str) -> str:
@@ -98,7 +26,7 @@ def pdf_set_unicode_font(pdf: FPDF) -> str:
     return "Arial"
 
 def wrap_long_tokens(s: str, max_len: int = 60) -> str:
-    s = str(s).replace("\\t", " ").replace("\\u00A0", " ").strip()
+    s = str(s).replace("\t", " ").replace("\u00A0", " ").strip()
     tokens, out = s.split(" "), []
     for t in tokens:
         if len(t) > max_len:
@@ -115,7 +43,8 @@ def plot_radar(series_dict, title="Desempenho por Categoria"):
     ax.set_title(title, y=1.08)
     ax.set_xticks(angles)
     ax.set_xticklabels(labels, fontsize=10)
-    ax.set_yticks([2, 4, 6, 8, 10]); ax.set_yticklabels(['2','4','6','8','10'])
+    ax.set_yticks([2, 4, 6, 8, 10])
+    ax.set_yticklabels(['2','4','6','8','10'])
     ax.grid(True)
     for lbl, ser in series_dict.items():
         vals = list(ser.values); vals_c = vals + vals[:1]
@@ -174,32 +103,44 @@ def perguntas_padrao_por_nivel(nivel: str) -> dict:
 st.set_page_config(page_title="Avaliação de Desempenho", layout="centered")
 st.title(APP_TITLE)
 
-# --- login ---
-if not do_login():
-    st.stop()
-st.sidebar.write(f"👤 **{st.session_state['user_name']}** ({st.session_state['user_email']})")
-logout()
-
 # 1) Nível e modelo
 nivel = st.selectbox("Nível do cargo (altera perguntas/skills padrão)",
                      ["Estagiário", "Assistente", "Analista", "Especialista"])
 modelo_base = perguntas_padrao_por_nivel(nivel)
-
-# 2) Carregar/salvar modelo pessoal
-c1, c2 = st.columns(2)
 perguntas_cfg = modelo_base
-if c1.button("📥 Carregar meu modelo salvo (este nível)"):
-    try:
-        modelo_user = load_model(st.session_state["user_email"], nivel)
-    except Exception as e:
-        modelo_user = None
-        st.warning(f"Falha ao carregar do storage: {e}")
-    if modelo_user:
-        perguntas_cfg = modelo_user
-        st.success("Modelo pessoal carregado.")
-    else:
-        st.info("Você ainda não salvou um modelo para este nível. Usando o padrão.")
 
+# 2) Importar/Exportar modelo (JSON local)
+st.markdown("### 🔄 Modelo de Perguntas (salvar/carregar)")
+cimp, cexp = st.columns(2)
+
+# Importar (carregar) JSON
+with cimp:
+    up = st.file_uploader("📥 Carregar modelo (JSON)", type=["json"], key="upload_model")
+    if up is not None:
+        try:
+            data = json.loads(up.read().decode("utf-8"))
+            if isinstance(data, dict) and "models" in data:
+                modelo_nivel = data.get("models", {}).get(nivel)
+                if modelo_nivel:
+                    perguntas_cfg = modelo_nivel
+                    st.success("Modelo do arquivo aplicado para o nível selecionado.")
+            elif isinstance(data, dict):
+                perguntas_cfg = data
+                st.success("Modelo do arquivo aplicado.")
+        except Exception as e:
+            st.error(f"Não foi possível ler o JSON: {e}")
+
+# Exportar (baixar) JSON
+with cexp:
+    export_payload = {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "models": {nivel: perguntas_cfg}
+    }
+    export_bytes = json.dumps(export_payload, ensure_ascii=False, indent=2).encode("utf-8")
+    st.download_button("📤 Baixar meu modelo (JSON)", data=export_bytes,
+                       file_name=f"modelo_perguntas_{nivel}.json", mime="application/json")
+
+# 3) Edição opcional do modelo
 editar = st.checkbox("Quero editar as perguntas", value=False)
 if editar:
     with st.expander("🔧 Editar perguntas (opcional)"):
@@ -212,13 +153,6 @@ if editar:
             txt = st.text_area(f"Perguntas para **{cat}** (1 por linha):", default, key=f"ta_{nivel}_{cat}")
             novo[cat] = [q.strip() for q in txt.split("\n") if q.strip()]
         perguntas_cfg = novo
-
-if c2.button("💾 Salvar meu modelo (este nível)"):
-    try:
-        save_model(st.session_state["user_email"], nivel, perguntas_cfg)
-        st.success("Modelo salvo com sucesso para seu perfil e nível!")
-    except Exception as e:
-        st.error(f"Falha ao salvar modelo: {e}")
 
 # Info do colaborador
 col1, col2 = st.columns(2)
@@ -366,7 +300,7 @@ if st.button("Gerar Relatório"):
         pdf = gerar_pdf(colaborador, avaliador, data_hoje, nivel,
                         df, media_atual, obs_por_categoria, pontos_positivos, oportunidades,
                         buf, media_ant=media_ant)
-        result = pdf.output(dest="S")  # fpdf2 retorna bytes; pyfpdf retorna str
+        result = pdf.output(dest="S")
         pdf_bytes = result if isinstance(result, (bytes, bytearray)) else result.encode("latin1")
         pdf_buf = BytesIO(pdf_bytes)
 
@@ -381,3 +315,4 @@ if st.button("Gerar Relatório"):
                                prev_pdf.getvalue(),
                                file_name=f"avaliacao_anterior_{nome_colab}.pdf",
                                mime="application/pdf")
+
